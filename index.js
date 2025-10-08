@@ -43,7 +43,7 @@ if (donationWebhookHandler) {
 // Allow FRONTEND/CLIENT_URL via env; fallback to localhost:5173 for dev
 const FRONTEND = process.env.CLIENT_URL || process.env.FRONTEND || "http://localhost:5173";
 
-const cors = require("cors");
+
 
 app.use(cors({
   origin: ["https://hdfintl.com"], // your frontend domain
