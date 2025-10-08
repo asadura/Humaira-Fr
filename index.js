@@ -43,18 +43,13 @@ if (donationWebhookHandler) {
 // Allow FRONTEND/CLIENT_URL via env; fallback to localhost:5173 for dev
 const FRONTEND = process.env.CLIENT_URL || process.env.FRONTEND || "http://localhost:5173";
 
+const cors = require("cors");
+
 app.use(cors({
-  origin: (origin, callback) => {
-    // allow non-browser requests (like curl) where origin is undefined
-    if (!origin) return callback(null, true);
-    if (origin === FRONTEND) return callback(null, true);
-    // in dev you might allow everything; here we deny others
-    const msg = `CORS policy: origin ${origin} not allowed`;
-    return callback(new Error(msg), false);
-  },
-  methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
-  credentials: true,
+  origin: ["https://hdfintl.com"], // your frontend domain
+  methods: ["GET", "POST", "PUT", "DELETE"],
 }));
+
 
 // Body parsers for normal routes
 app.use(express.json({ limit: "10mb" }));
