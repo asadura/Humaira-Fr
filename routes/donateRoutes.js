@@ -11,11 +11,22 @@ if (!stripeSecret) {
 }
 const stripe = Stripe(stripeSecret);
 
-// Helper: convert dollars to cents (accepts numbers or numeric strings)
+// Helper: convert dollars (or any major currency units) to cents (smallest currency unit)
+// accepts numbers or numeric strings
 function toCents(amount) {
-  const n = Number(amount);
+  const n = Number(String(amount).replace(",", "."));
   if (Number.isNaN(n) || !isFinite(n)) return null;
   return Math.round(n * 100);
+}
+
+// Helper: validate currency code (basic ISO-4217 style check)
+function normalizeCurrency(raw) {
+  if (!raw) return "usd";
+  if (typeof raw !== "string") return null;
+  const cur = raw.trim().toLowerCase();
+  // basic check: three alpha characters (e.g., "usd", "aud")
+  if (!/^[a-z]{3}$/.test(cur)) return null;
+  return cur;
 }
 
 /**
@@ -25,10 +36,15 @@ function toCents(amount) {
  */
 router.post("/payment-intent", async (req, res) => {
   try {
-    const { amount, name = "Anonymous Donor", currency = "usd" } = req.body ?? {};
+    const { amount, name = "Anonymous Donor", currency: rawCurrency } = req.body ?? {};
 
     if (amount == null) {
       return res.status(400).json({ message: "Missing amount in request body" });
+    }
+
+    const currency = normalizeCurrency(rawCurrency);
+    if (!currency) {
+      return res.status(400).json({ message: "Invalid currency. Use a 3-letter currency code like 'usd' or 'aud'." });
     }
 
     const cents = toCents(amount);
@@ -37,6 +53,7 @@ router.post("/payment-intent", async (req, res) => {
     }
 
     // Create PaymentIntent — use automatic payment methods
+    // Note: Stripe will error if your Stripe account does not support the requested currency.
     const paymentIntent = await stripe.paymentIntents.create({
       amount: cents,
       currency,
@@ -56,6 +73,12 @@ router.post("/payment-intent", async (req, res) => {
     });
   } catch (err) {
     console.error("Error in /payment-intent:", err && (err.raw || err.message) ? (err.raw || err.message) : err);
+
+    // Surface Stripe validation errors clearly when possible
+    if (err && err.type === "StripeInvalidRequestError") {
+      return res.status(400).json({ message: err.message || "Invalid payment request" });
+    }
+
     return res.status(500).json({ message: "Payment failed, try again." });
   }
 });
@@ -69,9 +92,14 @@ router.post("/payment-intent", async (req, res) => {
  */
 router.post("/create-checkout-session", async (req, res) => {
   try {
-    const { amount, name = "Anonymous Donor", currency = "usd" } = req.body ?? {};
+    const { amount, name = "Anonymous Donor", currency: rawCurrency } = req.body ?? {};
 
     if (amount == null) return res.status(400).json({ message: "Missing amount" });
+
+    const currency = normalizeCurrency(rawCurrency);
+    if (!currency) {
+      return res.status(400).json({ message: "Invalid currency. Use a 3-letter currency code like 'usd' or 'aud'." });
+    }
 
     const cents = toCents(amount);
     if (!cents || cents <= 0) return res.status(400).json({ message: "Invalid amount" });
@@ -81,6 +109,7 @@ router.post("/create-checkout-session", async (req, res) => {
     const successUrl = `${clientUrl}/success?session_id={CHECKOUT_SESSION_ID}`;
     const cancelUrl = `${clientUrl}/cancel`;
 
+    // Create checkout session using the requested currency
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       payment_method_types: ["card"],
@@ -107,6 +136,12 @@ router.post("/create-checkout-session", async (req, res) => {
     return res.json({ url: session.url });
   } catch (err) {
     console.error("Error in /create-checkout-session:", err && (err.raw || err.message) ? (err.raw || err.message) : err);
+
+    // If Stripe complains about currency or account capabilities, surface that
+    if (err && err.type === "StripeInvalidRequestError") {
+      return res.status(400).json({ message: err.message || "Invalid request to Stripe" });
+    }
+
     return res.status(500).json({ message: "Could not create checkout session" });
   }
 });
@@ -141,7 +176,7 @@ const webhookHandler = async (req, res) => {
     switch (event.type) {
       case "checkout.session.completed": {
         const session = event.data.object;
-        console.log(`✅ Checkout session completed: ${session.id}, amount_total: ${session.amount_total}`);
+        console.log(`✅ Checkout session completed: ${session.id}, amount_total: ${session.amount_total} ${session.currency}`);
         // TODO: store session info, send receipts, etc.
         break;
       }
