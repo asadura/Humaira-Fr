@@ -46,7 +46,7 @@ const FRONTEND = process.env.CLIENT_URL || process.env.FRONTEND || "http://local
 
 
 app.use(cors({
-  origin: ["https://hdfintl.com"], // your frontend domain
+  origin: ["https://www.hdfintl.com"], // your frontend domain
   methods: ["GET", "POST", "PUT", "DELETE"],
 }));
 
