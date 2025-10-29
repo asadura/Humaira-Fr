@@ -12,48 +12,38 @@ if (!stripeSecret) {
 const stripe = Stripe(stripeSecret);
 
 // Helper: convert dollars (or any major currency units) to cents (smallest currency unit)
-// accepts numbers or numeric strings
 function toCents(amount) {
   const n = Number(String(amount).replace(",", "."));
   if (Number.isNaN(n) || !isFinite(n)) return null;
   return Math.round(n * 100);
 }
 
-// Helper: validate currency code (basic ISO-4217 style check)
+// Helper: validate currency code
 function normalizeCurrency(raw) {
   if (!raw) return "usd";
   if (typeof raw !== "string") return null;
   const cur = raw.trim().toLowerCase();
-  // basic check: three alpha characters (e.g., "usd", "aud")
   if (!/^[a-z]{3}$/.test(cur)) return null;
   return cur;
 }
 
 /**
- * POST /payment-intent
- * Body: { amount: <dollars as number or string>, name?: string, currency?: "usd" }
- * Response: { clientSecret, paymentIntentId }
+ * POST /payment-intent (for direct client payment flow)
  */
 router.post("/payment-intent", async (req, res) => {
   try {
     const { amount, name = "Anonymous Donor", currency: rawCurrency } = req.body ?? {};
-
-    if (amount == null) {
-      return res.status(400).json({ message: "Missing amount in request body" });
-    }
+    if (amount == null) return res.status(400).json({ message: "Missing amount in request body" });
 
     const currency = normalizeCurrency(rawCurrency);
-    if (!currency) {
-      return res.status(400).json({ message: "Invalid currency. Use a 3-letter currency code like 'usd' or 'aud'." });
-    }
+    if (!currency)
+      return res
+        .status(400)
+        .json({ message: "Invalid currency. Use a 3-letter code like 'usd' or 'aud'." });
 
     const cents = toCents(amount);
-    if (!cents || cents <= 0) {
-      return res.status(400).json({ message: "Invalid amount" });
-    }
+    if (!cents || cents <= 0) return res.status(400).json({ message: "Invalid amount" });
 
-    // Create PaymentIntent — use automatic payment methods
-    // Note: Stripe will error if your Stripe account does not support the requested currency.
     const paymentIntent = await stripe.paymentIntents.create({
       amount: cents,
       currency,
@@ -62,134 +52,142 @@ router.post("/payment-intent", async (req, res) => {
       metadata: { donor_name: name },
     });
 
-    if (!paymentIntent || !paymentIntent.client_secret) {
-      console.error("Stripe created PaymentIntent but missing client_secret:", paymentIntent);
+    if (!paymentIntent?.client_secret)
       return res.status(500).json({ message: "Payment initialization failed" });
-    }
 
-    return res.json({
+    res.json({
       clientSecret: paymentIntent.client_secret,
       paymentIntentId: paymentIntent.id,
     });
   } catch (err) {
-    console.error("Error in /payment-intent:", err && (err.raw || err.message) ? (err.raw || err.message) : err);
-
-    // Surface Stripe validation errors clearly when possible
-    if (err && err.type === "StripeInvalidRequestError") {
+    console.error("Error in /payment-intent:", err);
+    if (err?.type === "StripeInvalidRequestError")
       return res.status(400).json({ message: err.message || "Invalid payment request" });
-    }
 
-    return res.status(500).json({ message: "Payment failed, try again." });
+    res.status(500).json({ message: "Payment failed, try again." });
   }
 });
 
 /**
  * POST /create-checkout-session
- * Body: { amount: <dollars>, name?: string, currency?: "usd" }
- * Response: { url: <stripe checkout url> }
- *
- * Redirect flow to Stripe Checkout (recommended for a simple redirect UI).
+ * Body: { amount, name?, currency?, frequency? }
+ * Supports: one-off, weekly, monthly
  */
 router.post("/create-checkout-session", async (req, res) => {
   try {
-    const { amount, name = "Anonymous Donor", currency: rawCurrency } = req.body ?? {};
+    const {
+      amount,
+      name = "Anonymous Donor",
+      currency: rawCurrency,
+      frequency = "one-off",
+    } = req.body ?? {};
 
-    if (amount == null) return res.status(400).json({ message: "Missing amount" });
+    if (amount == null)
+      return res.status(400).json({ message: "Missing amount in request body" });
 
     const currency = normalizeCurrency(rawCurrency);
-    if (!currency) {
-      return res.status(400).json({ message: "Invalid currency. Use a 3-letter currency code like 'usd' or 'aud'." });
-    }
+    if (!currency)
+      return res
+        .status(400)
+        .json({ message: "Invalid currency. Use 'usd', 'aud', etc." });
 
     const cents = toCents(amount);
-    if (!cents || cents <= 0) return res.status(400).json({ message: "Invalid amount" });
+    if (!cents || cents <= 0)
+      return res.status(400).json({ message: "Invalid amount" });
 
-    // client return URLs (use environment variable CLIENT_URL, fallback)
+    // client return URLs
     const clientUrl = process.env.CLIENT_URL || "http://localhost:5173";
     const successUrl = `${clientUrl}/success?session_id={CHECKOUT_SESSION_ID}`;
     const cancelUrl = `${clientUrl}/cancel`;
 
-    // Create checkout session using the requested currency
-    const session = await stripe.checkout.sessions.create({
-      mode: "payment",
-      payment_method_types: ["card"],
-      line_items: [
+    // Default: one-time payment
+    let mode = "payment";
+    let line_items = [
+      {
+        price_data: {
+          currency,
+          product_data: { name: `Donation from ${name}` },
+          unit_amount: cents,
+        },
+        quantity: 1,
+      },
+    ];
+
+    // ✅ Upgrade to subscription for weekly/monthly
+    if (frequency !== "one-off") {
+      const interval = frequency === "weekly" ? "week" : "month";
+      mode = "subscription";
+      line_items = [
         {
           price_data: {
             currency,
-            product_data: { name: `Donation from ${name}` },
+            product_data: {
+              name: `${frequency.charAt(0).toUpperCase() + frequency.slice(1)} Donation`,
+              description: `Recurring ${frequency} donation by ${name}`,
+            },
             unit_amount: cents,
+            recurring: { interval },
           },
           quantity: 1,
         },
-      ],
+      ];
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      mode,
+      payment_method_types: ["card"],
+      line_items,
       success_url: successUrl,
       cancel_url: cancelUrl,
-      metadata: { donor_name: name },
+      metadata: { donor_name: name, frequency },
     });
 
-    if (!session || !session.url) {
-      console.error("Stripe Checkout session creation returned unexpected:", session);
+    if (!session?.url)
       return res.status(500).json({ message: "Failed to create checkout session" });
-    }
 
-    return res.json({ url: session.url });
+    res.json({ url: session.url });
   } catch (err) {
-    console.error("Error in /create-checkout-session:", err && (err.raw || err.message) ? (err.raw || err.message) : err);
-
-    // If Stripe complains about currency or account capabilities, surface that
-    if (err && err.type === "StripeInvalidRequestError") {
+    console.error("Error in /create-checkout-session:", err);
+    if (err?.type === "StripeInvalidRequestError")
       return res.status(400).json({ message: err.message || "Invalid request to Stripe" });
-    }
 
-    return res.status(500).json({ message: "Could not create checkout session" });
+    res.status(500).json({ message: "Could not create checkout session" });
   }
 });
 
 /**
- * Webhook handler (exported separately)
- * Mount with:
- * app.post("/api/donate/webhook", express.raw({ type: "application/json" }), donationWebhookHandler);
+ * Webhook handler
  */
 const webhookHandler = async (req, res) => {
   const sig = req.headers["stripe-signature"];
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-
-  if (!webhookSecret) {
-    console.warn("⚠️ STRIPE_WEBHOOK_SECRET not set — cannot verify webhook signature.");
-  }
 
   let event;
   try {
     if (webhookSecret) {
       event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
     } else {
-      // only for dev without webhook secret
-      event = req.body && typeof req.body === "object" ? req.body : JSON.parse(req.body);
+      event = typeof req.body === "object" ? req.body : JSON.parse(req.body);
     }
   } catch (err) {
-    console.error("⚠️ Webhook signature verification failed:", err && err.message ? err.message : err);
-    return res.status(400).send(`Webhook Error: ${err && err.message ? err.message : "invalid signature"}`);
+    console.error("⚠️ Webhook verification failed:", err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
   try {
     switch (event.type) {
-      case "checkout.session.completed": {
+      case "checkout.session.completed":
         const session = event.data.object;
-        console.log(`✅ Checkout session completed: ${session.id}, amount_total: ${session.amount_total} ${session.currency}`);
-        // TODO: store session info, send receipts, etc.
+        console.log(
+          `✅ Checkout session completed: ${session.id}, amount_total: ${session.amount_total} ${session.currency}`
+        );
         break;
-      }
-      case "payment_intent.succeeded": {
-        const pi = event.data.object;
-        console.log(`✅ PaymentIntent succeeded: ${pi.id} (${pi.amount} ${pi.currency})`);
+      case "invoice.payment_succeeded":
+        console.log("✅ Subscription payment succeeded:", event.data.object.id);
         break;
-      }
-      case "payment_intent.payment_failed": {
-        const pi = event.data.object;
-        console.warn(`❌ PaymentIntent failed: ${pi.id}`);
+      case "invoice.payment_failed":
+        console.warn("❌ Subscription payment failed:", event.data.object.id);
         break;
-      }
       default:
         console.log(`ℹ️ Unhandled event type: ${event.type}`);
     }
